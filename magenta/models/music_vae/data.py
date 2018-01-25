@@ -32,6 +32,7 @@ import magenta.music as mm
 from magenta.music import drums_encoder_decoder
 from magenta.music import sequences_lib
 from magenta.protobuf import music_pb2
+from tensorflow.python.util import nest
 
 PIANO_MIN_MIDI_PITCH = 21
 PIANO_MAX_MIDI_PITCH = 108
@@ -974,3 +975,225 @@ def get_dataset(config, tf_file_reader_class=tf.data.TFRecordDataset,
              .map(_remove_pad_fn))
 
   return dataset
+
+
+class TooLongError(Exception):
+  """Exception for when an array is too long."""
+  pass
+
+
+def pad_with_element(nested_list, max_lengths, element):
+  """Pads a nested list of elements up to `max_lengths`.
+
+  For example, `pad_with_element([[0, 1, 2], [3, 4]], [3, 4], 5)` produces
+  `[[0, 1, 2, 5], [3, 4, 5, 5], [5, 5, 5, 5]]`.
+
+  Args:
+    nested_list: A (potentially nested) list.
+    max_lengths: The maximum length at each level of the nested list to pad to.
+    element: The element to pad with at the lowest level. If an object, a copy
+      is not made, and the same instance will be used multiple times.
+
+  Returns:
+    `nested_list`, padded up to `max_lengths` with `element`.
+
+  Raises:
+    TooLongError: If any of the nested lists are already longer than the
+      maximum length at that level given by `max_lengths`.
+  """
+  if not max_lengths:
+    return nested_list
+
+  max_length = max_lengths[0]
+  delta = max_length - len(nested_list)
+  if delta < 0:
+    raise TooLongError
+
+  if len(max_lengths) == 1:
+    return nested_list + [element] * delta
+  else:
+    return [pad_with_element(l, max_lengths[1:], element)
+            for l in nested_list + [[] for _ in range(delta)]]
+
+
+def pad_with_value(array, length, pad_value):
+  """Pad numpy array so that its first dimension is length.
+
+  Args:
+    array: A 2D numpy array.
+    length: Desired length of the first dimension.
+    pad_value: Value to pad with.
+  Returns:
+    array, padded to shape `[length, array.shape[1]]`.
+  Raises:
+    TooLongError: If the array is already longer than length.
+  """
+  if array.shape[0] > length:
+    raise TooLongError
+  return np.pad(array, ((0, length - array.shape[0]), (0, 0)), 'constant',
+                constant_values=pad_value)
+
+
+class BaseHierarchicalConverter(BaseConverter):
+  """Base class for data converters for hierarchical sequences.
+
+  Output sequences will be padded hierarchically and flattened if `max_lengths`
+  is defined. For example, if `max_lengths = [3, 2, 4]`, `end_token=5`, and the
+  underlying `_to_tensors` implementation returns an example
+  (before one-hot conversion) [[[1, 5]], [[2, 3, 5]]], `to_tensors` will
+  convert it to:
+    `[[1, 5, 0, 0], [5, 0, 0, 0],
+      [2, 3, 5, 0], [5, 0, 0, 0],
+      [5, 0, 0, 0], [5, 0, 0, 0]]`
+  If any of the lengths are beyond `max_lengths`, the tensor will be filtered.
+
+  Inheriting classes must implement the following abstract methods:
+    -`_to_tensors`
+    -`_to_items`
+  """
+
+  def __init__(self, input_depth, input_dtype, output_depth, output_dtype,
+               end_token, max_lengths=None, max_tensors_per_item=None,
+               str_to_item_fn=lambda s: s):
+    self._max_lengths = [] if max_lengths is None else max_lengths
+    super(BaseHierarchicalConverter, self).__init__(
+        input_depth=input_depth,
+        input_dtype=input_dtype,
+        output_depth=output_depth,
+        output_dtype=output_dtype,
+        end_token=end_token,
+        max_tensors_per_item=max_tensors_per_item,
+        str_to_item_fn=str_to_item_fn,
+        length_shape=(np.prod(max_lengths[:-1]),) if max_lengths else ())
+
+  def to_tensors(self, item):
+    """Converts to tensors and adds hierarchical padding, if needed."""
+    unpadded_results = super(BaseHierarchicalConverter, self).to_tensors(item)
+    if not self._max_lengths:
+      return unpadded_results
+
+    def _hierarchical_pad(input_, output):
+      """Pad and flatten hierarchical inputs and outputs."""
+      # Pad empty segments with end tokens and flatten hierarchy.
+      input_ = nest.flatten(pad_with_element(
+          input_, self._max_lengths[:-1],
+          np_onehot([self.end_token], self.input_depth)))
+      output = nest.flatten(pad_with_element(
+          output, self._max_lengths[:-1],
+          np_onehot([self.end_token], self.output_depth)))
+      length = np.squeeze(np.array([len(x) for x in input_], np.int32))
+
+      # Pad and concatenate flatten hierarchy.
+      input_ = np.concatenate(
+          [pad_with_value(x, self._max_lengths[-1], 0) for x in input_])
+      output = np.concatenate(
+          [pad_with_value(x, self._max_lengths[-1], 0) for x in output])
+
+      return input_, output, length
+
+    padded_results = []
+    for i, o, _ in zip(*unpadded_results):
+      try:
+        padded_results.append(_hierarchical_pad(i, o))
+      except TooLongError:
+        continue
+
+    return tuple(zip(*padded_results)) if padded_results else ([], [], [])
+
+
+class SentenceConverter(BaseHierarchicalConverter):
+  r"""Class for converting text data to (hierarchical) model input.
+
+  Hierarchical data is handled using the `max_lengths` and `split_tokens` args.
+
+  For example, if `split_tokens = ['\n', ' ']`, then the data will first be
+  split into words (using the space as a delimiter) and then into lines (using
+  the newline character as a delimiter). In this case, max_lengths must be
+  length-3; the first entry would denote the maximum number of sentences,
+  the second entry would denote the maximum number of words in a sentence and
+  the third would be the maximum number of characters in a word.
+  Any text with more than `max_lengths[0]` words in a sentence or
+  `max_lengths[1]` characters in a word, etc. will be discarded. Note that the
+  values in `max_length` should include end-of-sequence tokens in their counts.
+
+  Args:
+    max_lengths: (Optional) The maximum length at each level of the hierarchy,
+      sized `[len(split_tokens) + 1]`.
+    split_tokens: (Optional) Characters to use to split text into the hierarchy,
+      sized `[len(max_lengths) - 1]`. These character tokenss will not be
+      included in the converted output.
+    valid_chars: Ordinal values of permissable characters.
+
+  Raises:
+    ValueError: If `max_length` or `split_tokens` is given but
+      `len(max_length) != len(split_tokens) + 1`.
+  """
+
+  def __init__(self,
+               max_lengths=None,
+               split_tokens=None,
+               valid_chars=range(32, 127)):
+    self._char_map = {chr(c): i for i, c in enumerate(valid_chars)}
+    self._chars = [chr(c) for c in valid_chars]
+    depth = len(valid_chars) + 1
+    self._split_tokens = [] if split_tokens is None else split_tokens
+
+    super(SentenceConverter, self).__init__(
+        input_depth=depth,
+        input_dtype=np.bool,
+        output_depth=depth,
+        output_dtype=np.bool,
+        end_token=len(valid_chars),
+        max_lengths=max_lengths,
+        max_tensors_per_item=None)
+
+    if ((self._max_lengths or self._split_tokens) and
+        len(self._max_lengths) != len(self._split_tokens) +1):
+      raise ValueError(
+          '`max_lengths` be 1 longer than `split_tokens`.'
+          ' Got %d and %d.' % (len(self._max_lengths), len(self._split_tokens)))
+
+  def _text_to_onehot(self, sentence):
+    """Python method that converts `sentence` into tensors."""
+    labels = []
+    for c in sentence:
+      if c not in self._char_map:
+        tf.logging.warning('Skipped sentence with invalid char `%s`: %s',
+                           c, sentence)
+        return []
+      labels.append(self._char_map[c])
+    labels.append(self._end_token)
+    seqs = np_onehot(labels, depth=self._output_depth)
+    return seqs
+
+  def _to_tensors(self, text):
+    """Python method that converts `text` into tensors."""
+    for token in self._split_tokens:
+      text = nest.map_structure(lambda s: s.split(token), text)  # pylint: disable=cell-var-from-loop
+    text = nest.map_structure(self._text_to_onehot, text)
+    return [text], [text]
+
+  def _to_items(self, samples):
+    """Python method that decodes samples into list of sentences."""
+    def _to_text(sample):
+      tokens = np.argmax(sample, axis=-1).tolist()
+      if self.end_token is not None and self.end_token in tokens:
+        tokens = tokens[:tokens.index(self.end_token)]
+      text = ''
+      for t in tokens:
+        assert t != self.end_token
+        text += self._chars[t]
+      return text
+
+    sentences = []
+    for sample in samples:
+      if not self._split_tokens:
+        sentences.append(_to_text(sample))
+      elif len(self._split_tokens) == 1:
+        sample = sample.reshape(self._max_lengths + [-1])
+        words = [_to_text(segment) for segment in sample]
+        sentences.append(self._split_tokens[0].join([w for w in words if w]))
+      else:
+        raise ValueError('Unsupported number of `split_tokens`.')
+
+    return sentences

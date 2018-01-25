@@ -281,3 +281,75 @@ CONFIG_MAP['hiercat-mel_16bar_big'] = Config(
     train_examples_path=None,
     eval_examples_path=None,
 )
+
+# Text
+CONFIG_MAP['cat-sentence'] = Config(
+    model=MusicVAE(lstm_models.BidirectionalLstmEncoder(),
+                   lstm_models.CategoricalLstmDecoder()),
+    hparams=merge_hparams(
+        lstm_models.get_default_hparams(),
+        HParams(
+            batch_size=512,
+            max_seq_len=512,
+            z_size=256,
+            enc_rnn_size=[512, 512],
+            dec_rnn_size=[512, 512, 512],
+        )),
+    note_sequence_augmenter=None,
+    data_converter=data.SentenceConverter(),
+    # pylint:disable=line-too-long
+    train_examples_path=None,
+    eval_examples_path=None,
+    # pylint:enable=line-too-long
+)
+
+CONFIG_MAP['hiercat-sentence-auto'] = Config(
+    model=MusicVAE(
+        lstm_models.HierarchicalLstmEncoder(
+            lstm_models.BidirectionalLstmEncoder, [24]),
+        lstm_models.HierarchicalLstmDecoder(
+            lstm_models.CategoricalLstmDecoder(), [24])),
+    hparams=merge_hparams(
+        lstm_models.get_default_hparams(),
+        HParams(
+            max_seq_len=384,
+            batch_size=512,
+            z_size=512,
+            enc_rnn_size=[512],
+            dec_rnn_size=[512, 512],
+        )),
+    note_sequence_augmenter=None,
+    data_converter=data.SentenceConverter(
+        split_tokens=[' '],
+        max_lengths=[24, 16]),
+    # pylint:disable=line-too-long
+    train_examples_path=None,
+    eval_examples_path=None,
+    # pylint:enable=line-too-long
+)
+
+CONFIG_MAP['hiercat-sentence-noauto'] = Config(
+    model=MusicVAE(
+        lstm_models.HierarchicalLstmEncoder(
+            lstm_models.BidirectionalLstmEncoder, [24]),
+        lstm_models.HierarchicalLstmDecoder(
+            lstm_models.CategoricalLstmDecoder(), [24],
+            disable_autoregression=True)),
+    hparams=merge_hparams(
+        lstm_models.get_default_hparams(),
+        HParams(
+            max_seq_len=384,
+            batch_size=512,
+            z_size=512,
+            enc_rnn_size=[512],
+            dec_rnn_size=[512, 512],
+        )),
+    note_sequence_augmenter=None,
+    data_converter=data.SentenceConverter(
+        split_tokens=[' '],
+        max_lengths=[24, 16]),
+    # pylint:disable=line-too-long
+    train_examples_path=None,
+    eval_examples_path=None,
+    # pylint:enable=line-too-long
+)

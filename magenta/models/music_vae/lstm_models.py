@@ -917,3 +917,324 @@ def get_default_hparams():
       'use_cudnn': False,  # Uses faster CudnnLSTM to train. For GPU only.
   })
   return tf.contrib.training.HParams(**hparams_map)
+
+
+def _maybe_split_sequence_lengths(sequence_length, num_splits, total_length):
+  """Validates and splits `sequence_length`, if necessary.
+
+  Returned value must be used in graph for all validations to be executed.
+
+  Args:
+    sequence_length: A batch of sequence lengths, either sized `[batch_size]`
+      and equal to either 0 or `total_length`, or sized
+      `[batch_size, num_splits]`.
+    num_splits: The scalar number of splits of the full sequences.
+    total_length: The scalar total sequence length (potentially padded).
+
+  Returns:
+    sequence_length: If input shape was `[batch_size, num_splits]`, returns the
+      same Tensor. Otherwise, returns a Tensor of that shape with each input
+      length in the batch divided by `num_splits`.
+  Raises:
+    ValueError: If `sequence_length` is not shaped `[batch_size]` or
+      `[batch_size, num_splits]`.
+    tf.errors.InvalidArgumentError: If `sequence_length` is shaped
+      `[batch_size]` and all values are not either 0 or `total_length`.
+  """
+  if sequence_length.shape.ndims == 1:
+    if total_length % num_splits != 0:
+      raise ValueError(
+          '`total_length` must be evenly divisible by `num_splits`.')
+    with tf.control_dependencies(
+        [tf.Assert(
+            tf.reduce_all(
+                tf.logical_or(tf.equal(sequence_length, 0),
+                              tf.equal(sequence_length, total_length))),
+            data=[sequence_length])]):
+      sequence_length = (
+          tf.tile(tf.expand_dims(sequence_length, axis=1), [1, num_splits]) //
+          num_splits)
+  elif sequence_length.shape.ndims == 2:
+    sequence_length.set_shape([sequence_length.shape[0], num_splits])
+  else:
+    raise ValueError(
+        'Sequence lengths must be given as a vector or a 2D Tensor whose '
+        'second dimension size matches its initial hierarchical split. Got '
+        'shape: %s' % sequence_length.shape.as_list())
+  return sequence_length
+
+
+class HierarchicalLstmEncoder(base_model.BaseEncoder):
+  """Hierarchical LSTM encoder with fixed number of outputs per level."""
+
+  def __init__(self, core_encoder_cls, level_output_lengths):
+    """Initializer for HierarchicalLstmEncoder.
+
+    Args:
+      core_encoder_cls: A single BaseEncoder class to use for each level of the
+        hierarchy.
+      level_output_lengths: A list of the number of outputs of each level of the
+        hierarchy. The initial level must divide `max_seq_len` evenly, and
+        subsequent levels must divide the previous level evenly. A final level
+        of length 1 will be added if not given.
+
+    Raises:
+      ValueError: If a level length does not evenly divide the previous level.
+    """
+    self._core_encoder_cls = core_encoder_cls
+    if level_output_lengths[-1] != 1:
+      tf.logging.warning(
+          'Adding a final hierarchical level with output length 1 to '
+          'HierarchicalLstmEncoder.')
+      level_output_lengths.append(1)
+    for i in range(1, len(level_output_lengths)):
+      prev_l, l = level_output_lengths[i-1:i+1]
+      if prev_l % l != 0:
+        raise ValueError(
+            'HierarchicalLstmEncoder level length (%d) does not evenly divide '
+            'the previous level length (%d).' % (l, prev_l))
+
+    self._level_output_lengths = level_output_lengths
+
+  def build(self, hparams, is_training=True):
+    self._total_length = hparams.max_seq_len
+    if self._total_length % self._level_output_lengths[0] != 0:
+      raise ValueError(
+          'The first HierarchicalLstmEncoder level length (%d) does not evenly '
+          'divide the input sequence length (%d).' % (
+              self._level_output_lengths[0], self._total_length))
+    tf.logging.info('\nHierarchical Encoder:\n'
+                    '  input length: %d\n'
+                    '  level output lengths: %s\n',
+                    self._total_length,
+                    self._level_output_lengths)
+    self._hierarchical_encoders = []
+    for i, l in enumerate(self._level_output_lengths):
+      h_encoder = self._core_encoder_cls()
+      h_encoder.build(
+          hparams, is_training,
+          name_or_scope=tf.VariableScope(
+              tf.AUTO_REUSE, 'encoder/hierarchical_level_%d' % i))
+      self._hierarchical_encoders.append((l, h_encoder))
+
+  def encode(self, sequence, sequence_length):
+    batch_size = sequence.shape[0].value
+    sequence_length = _maybe_split_sequence_lengths(
+        sequence_length, self._level_output_lengths[0], self._total_length)
+
+    for level, (num_splits, h_encoder) in enumerate(
+        self._hierarchical_encoders):
+      split_seqs = tf.split(sequence, num_splits, axis=1)
+      # In the first level, we use the input `sequence_lengths`. After that,
+      # we use the full embedding sequences.
+      sequence_length = (
+          sequence_length if level == 0 else
+          tf.fill([batch_size, num_splits], split_seqs[0].shape[1]))
+      split_lengths = tf.unstack(sequence_length, axis=1)
+      embeddings = [
+          h_encoder.encode(s, l) for s, l in zip(split_seqs, split_lengths)]
+      sequence = tf.stack(embeddings, axis=1)
+
+    with tf.control_dependencies([tf.assert_equal(tf.shape(sequence)[1], 1)]):
+      return sequence[:, 0]
+
+
+class HierarchicalLstmDecoder(base_model.BaseDecoder):
+  """Hierarchical LSTM decoder."""
+
+  def __init__(self, core_decoder, level_output_lengths,
+               disable_autoregression=False):
+    """Initializer for HierarchicalLstmDecoder.
+
+    Args:
+      core_decoder: The BaseDecoder implementation object to use at the output
+          level.
+      level_output_lengths: A list of the number of outputs of each level of the
+        hierarchy. The final level must divide max_seq_len evenly, and
+        each level must divide the next level evenly.
+      disable_autoregression: Whether to disable the autoregression within the
+        hierarchy.
+
+    Raises:
+      ValueError: If a level length does not evenly divide the next level.
+    """
+    for i in range(len(level_output_lengths) - 1):
+      l, next_l = level_output_lengths[i-1:i+1]
+      if next_l % l != 0:
+        raise ValueError(
+            'HierarchicalLstmDecoder level length (%d) does not evenly divide '
+            'the next level length (%d).' % (l, next_l))
+    self._core_decoder = core_decoder
+    self._level_output_lengths = level_output_lengths
+    self._disable_autoregression = disable_autoregression
+
+  def build(self, hparams, output_depth, is_training):
+    self.hparams = hparams
+    self._output_depth = output_depth
+    self._total_length = hparams.max_seq_len
+    if self._total_length % self._level_output_lengths[-1] != 0:
+      raise ValueError(
+          'The final HierarchicalLstmDecoder level length (%d) does not evenly '
+          'divide the input sequence length (%d).' % (
+              self._level_output_lengths[0], self._total_length))
+    tf.logging.info('\nHierarchical Decoder:\n'
+                    '  input length: %d\n'
+                    '  level output lengths: %s\n',
+                    self._total_length,
+                    self._level_output_lengths)
+
+    self._hier_cell = rnn_cell(
+        hparams.dec_rnn_size, dropout_keep_prob=hparams.dropout_keep_prob)
+
+    with tf.variable_scope('core_decoder', reuse=tf.AUTO_REUSE):
+      self._core_decoder.build(hparams, output_depth, is_training)
+
+  def _hierarchical_decode(self, z, base_decode_fn):
+    """Depth first decoding from `z`, passing final embeddings to base fn."""
+
+    hparams = self.hparams
+    batch_size = hparams.batch_size
+
+    def recursive_decode(initial_input, path=None):
+      """Recursive hierarchical decode function."""
+      path = path or []
+      level = len(path)
+
+      if level == len(self._level_output_lengths):
+        with tf.variable_scope('core_decoder', reuse=tf.AUTO_REUSE):
+          return base_decode_fn(initial_input, path)
+
+      scope = tf.VariableScope(
+          tf.AUTO_REUSE, 'decoder/hierarchical_level_%d' % level)
+      num_steps = self._level_output_lengths[level] // (
+          self._level_output_lengths[level-1] if level else 1)
+      with tf.variable_scope(scope):
+        state = initial_cell_state_from_embedding(
+            self._hier_cell, initial_input, name='initial_state')
+      if level == 0 and not self._disable_autoregression:
+        # The initial input to the first level should be the size as the tensors
+        # returned by the lower levels.
+        input_size = sum(nest.flatten(self._hier_cell.state_size))
+        next_input = tf.layers.dense(
+            initial_input,
+            input_size,
+            activation=tf.tanh,
+            kernel_initializer=tf.random_normal_initializer(stddev=0.001),
+            name='decoder/initial_input')
+      else:
+        next_input = initial_input
+      for i in range(num_steps):
+        if self._disable_autoregression:
+          next_input = tf.zeros([batch_size, 1])
+        output, state = self._hier_cell(next_input, state, scope)
+        final_state = recursive_decode(output, path + [i])
+        next_input = tf.concat(nest.flatten(final_state), axis=-1)
+      return state
+
+    return recursive_decode(z)
+
+  def reconstruction_loss(self, x_input, x_target, x_length, z=None):
+    batch_size = x_input.shape[0].value
+
+    x_length = _maybe_split_sequence_lengths(
+        x_length, self._level_output_lengths[-1], self._total_length)
+
+    def _reshape_to_hierarchy(t):
+      """Reshapes `t` so that its initial dimensions match the hierarchy."""
+      t_shape = t.shape.as_list()
+      t_rank = len(t_shape)
+      hier_shape = [batch_size] + self._level_output_lengths
+      if t_rank == 3:
+        hier_shape += [-1] + t_shape[2:]
+      elif t_rank != 2:
+        # We only expect rank-2 for lengths and rank-3 for sequences.
+        raise ValueError('Unexpected shape for tensor: %s' % t)
+      hier_t = tf.reshape(t, hier_shape)
+      # Move the batch dimension to after the hierarchical dimensions.
+      num_levels = len(self._level_output_lengths)
+      perm = range(len(hier_shape))
+      perm.insert(num_levels, perm.pop(0))
+      return tf.transpose(hier_t, perm)
+
+    hier_input = _reshape_to_hierarchy(x_input)
+    hier_target = _reshape_to_hierarchy(x_target)
+    hier_length = _reshape_to_hierarchy(x_length)
+
+    hier_length = tf.maximum(hier_length, 2)
+    loss_outputs = []
+    def base_train_fn(embedding, hier_index):
+      split_input = hier_input[hier_index]
+      split_target = hier_target[hier_index]
+      split_length = hier_length[hier_index]
+
+      res = self._core_decoder.reconstruction_loss(
+          split_input, split_target, split_length, embedding)
+      loss_outputs.append(res[:-1])
+      # Return final state.
+      return res[-1]
+
+    z = tf.zeros([batch_size, 0]) if z is None else z
+    final_state = self._hierarchical_decode(z, base_train_fn)
+
+    # Accumulate the split sequence losses.
+    r_losses, _, truth, predictions = zip(*loss_outputs)
+    r_losses = tf.reduce_sum(r_losses, axis=0)
+    truth = tf.concat(truth, axis=-1)
+    predictions = tf.concat(predictions, axis=-1)
+    # TODO(adarob): Base metrics on those in the returned metric map.
+    metric_map = {
+        'metrics/accuracy': tf.metrics.accuracy(truth, predictions),
+        'metrics/mean_per_class_accuracy': tf.metrics.mean_per_class_accuracy(
+            truth, predictions, self._output_depth)
+    }
+    return r_losses, metric_map, truth, predictions, final_state
+
+  def sample(self, n, max_length=None, z=None, **core_sampler_kwargs):
+    """Sample from decoder with an optional conditional latent vector `z`.
+
+    Args:
+      n: Scalar number of samples to return.
+      max_length: (Optional) maximum total length of samples. If given, must
+        match `hparams.max_seq_len`.
+      z: (Optional) Latent vectors to sample from. Required if model is
+        conditional. Sized `[n, z_size]`.
+      **core_sampler_kwargs: (Optional) Additional keyword arguments to pass to
+        core sampler.
+    Returns:
+      samples: Sampled sequences. Sized
+        `[n, level_output_lengths[-1], total_length / level_output_lengths[-1],
+          output_depth]`.
+      final_state: The final states of the decoder.
+    Raises:
+      ValueError: If `z` is provided and its first dimension does not equal `n`.
+    """
+    if z is not None and z.shape[0].value != n:
+      raise ValueError(
+          '`z` must have a first dimension that equals `n` when given. '
+          'Got: %d vs %d' % (z.shape[0].value, n))
+    z = tf.zeros([n, 0]) if z is None else z
+
+    if max_length is not None:
+      with tf.control_dependencies([
+          tf.assert_equal(
+              max_length, self._total_length,
+              message='`max_length` must equal `hparams.max_seq_len` if given.')
+      ]):
+        max_length = tf.identity(max_length)
+
+    split_max_length = self._total_length // self._level_output_lengths[-1]
+    all_sample_ids = []
+    def base_sample_fn(embedding, unused_path):
+      sample_ids, final_state = self._core_decoder.sample(
+          n, max_length=split_max_length, z=embedding, **core_sampler_kwargs)
+      all_sample_ids.append(sample_ids)
+      return final_state
+
+    # Populate `all_sample_ids`.
+    final_state = self._hierarchical_decode(z, base_sample_fn)
+
+    all_sample_ids = tf.concat(
+        [tf.pad(s, [(0, 0), (0, split_max_length - tf.shape(s)[1]), (0, 0)])
+         for s in all_sample_ids],
+        axis=1)
+    return all_sample_ids, final_state
